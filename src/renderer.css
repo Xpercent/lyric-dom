@@ -163,9 +163,11 @@
     vertical-align: bottom;
   }
 
-  /* 假名宽于被注音文字时，用负外边距回收假名挤占的行内宽度，溢出量由测量写入 */
+  /* 假名宽于被注音文字时用负外边距回收其挤占的行内宽度，回收量由测量写出；
+     左右两侧只回收到相邻假名即将相撞为止，相撞处让注音自行撑开 */
   & > span.lp-ruby-word {
-    margin-inline: calc(-0.5 * var(--lp-ruby-overflow, 0px));
+    margin-left: calc(-1 * var(--lp-ruby-reclaim-left, 0px));
+    margin-right: calc(-1 * var(--lp-ruby-reclaim-right, 0px));
   }
 
   ruby {
