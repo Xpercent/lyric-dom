@@ -1,166 +1,109 @@
-/**
- * 词内注音的宽度回收与碰撞撑开
- * 回收让主歌词字距保持紧凑，相撞的假名按实测几何退回撑开排版
- */
-import type { WordMeasurement } from "../types";
+/** 词内注音的悬挂判定与回收量估算 */
 
-/** 相邻假名之间保留的最小间距（像素） */
-const MIN_GAP = 0.5;
+import type { LyricWord } from "../types";
 
-/** 碰撞撑开的最大轮次，撑开引发的重新换行需额外轮次复核 */
-const MAX_PASSES = 3;
+/** renderer.css 中注音相对单词的字号比例 */
+const RUBY_SIZE_RATIO = 0.5;
 
-/** 注音假名的占位区间 */
-export interface RubyBand {
-  /** 左边界 */
-  left: number;
-  /** 右边界 */
-  right: number;
-  /** 上边界 */
-  top: number;
-  /** 下边界 */
-  bottom: number;
-}
+/** 平假名、片假名与長音符，即 §4067 的 cl-10、cl-11、cl-15、cl-16 */
+const KANA_ONLY = /^[\p{Script=Hiragana}\p{Script=Katakana}\u30FC\uFF70]+$/u;
 
-/** 注音单词的排版状态 */
-interface RubyWord {
-  /** 单词 span 元素 */
-  element: HTMLSpanElement;
-  /** 词内假名元素 */
-  annotations: HTMLElement[];
-  /** 假名挤占主歌词的行内宽度 */
-  overflow: number;
-  /** 是否已取消回收，退回注音撑开间距的自然排版 */
-  expanded: boolean;
+/** 假名与汉字，字体中均按全角计宽，据此可由字符数估算盒宽 */
+const FULL_WIDTH_ONLY =
+  /^[\p{Script=Hiragana}\p{Script=Katakana}\p{Unified_Ideograph}\u30FC\uFF70]+$/u;
+
+/** 按渲染顺序展开的判定单元 */
+interface RubyAtom {
+  word: LyricWord;
+  text: string;
+  rubyText: string;
 }
 
 /**
- * 找出与其它占位相交的占位下标，占位需按 left 升序传入
- * @param bands - 同一行内的注音假名占位区间
- * @returns 发生碰撞的占位下标
+ * 判断相邻字符能否承接悬挂过来的假名
+ *
+ * §4067 允许注音悬挂到平假名、片假名、長音符与促音拗音等小字符上，悬挂到汉字上
+ * 会被误读为该汉字的读音故不允许；拉丁字母、数字与标点同样不允许，空白本身即是
+ * 可用间距故允许。長音符的 Unicode Script 归为 Common，需单独列出。
+ * @param char - 相邻单元靠近本词一侧的字符
  */
-export const findRubyCollisions = (bands: RubyBand[]) => {
-  const collided = new Set<number>();
-  for (let i = 0; i < bands.length; i++) {
-    const current = bands[i];
-    // 已按 left 升序，首个不再横向交叠的占位之后都不会与当前相交
-    for (let j = i + 1; j < bands.length && bands[j].left < current.right - MIN_GAP; j++) {
-      if (current.top < bands[j].bottom && bands[j].top < current.bottom) {
-        collided.add(i);
-        collided.add(j);
-      }
-    }
+function isHangableChar(char: string | undefined): boolean {
+  if (char === undefined) return false;
+  if (/\s/u.test(char)) return true;
+  return /^[\p{Script=Hiragana}\p{Script=Katakana}\u30FC\uFF70]$/u.test(char);
+}
+
+/**
+ * 估算注音为基字撑开的行内宽度，以单词字号计
+ *
+ * 注音字号为 0.5em，假名与汉字均按全角计，故撑开量为假名数的一半减去基字数。
+ * 逐字注音时各字独立撑开，其总和恒不小于该估算值，按估算值回收不会挤叠基文字。
+ * @param atom - 判定单元
+ */
+function measureExpansion(atom: RubyAtom): number {
+  if (atom.rubyText.length === 0) return 0;
+  if (!FULL_WIDTH_ONLY.test(atom.text) || !KANA_ONLY.test(atom.rubyText)) return 0;
+  const ruby = Array.from(atom.rubyText).length;
+  const base = Array.from(atom.text).length;
+  return Math.max(0, ruby * RUBY_SIZE_RATIO - base);
+}
+
+/**
+ * 判断相邻单元能否承接悬挂
+ * @param atom - 相邻单元，位于行界时为空
+ * @param char - 相邻单元靠近本词一侧的字符
+ */
+function canReceiveHang(atom: RubyAtom | undefined, char: string | undefined): boolean {
+  if (atom === undefined || char === undefined) return false;
+  return isHangableChar(char) && measureExpansion(atom) === 0;
+}
+
+/**
+ * 沿一侧向外检查可承接悬挂的间距是否足够
+ *
+ * 撑开量按字符数估算，实际字体度量略宽时宁可少回收，也不让假名压到汉字上。
+ * @param atoms - 按渲染顺序排列的判定单元
+ * @param index - 本词在 atoms 中的下标
+ * @param step - 检查方向，向左为 `-1`、向右为 `1`
+ */
+function hasHangRoom(atoms: readonly RubyAtom[], index: number, step: number): boolean {
+  let need = measureExpansion(atoms[index]) / 2;
+  for (let i = index + step; ; i += step) {
+    const neighbor = atoms[i];
+    if (!canReceiveHang(neighbor, neighbor?.text.at(step > 0 ? 0 : -1))) return false;
+    need -= Array.from(neighbor.text).length;
+    if (need <= 0) return true;
   }
-  return collided;
-};
+}
 
 /**
- * 写出单词的回收量，已撑开的单词回收量归零
- * @param word - 注音单词
+ * 估算每个带注音单词可向两侧假名悬挂回收的行内宽度
+ *
+ * 回收需左右两侧均有 §4067 允许承接悬挂的字符，且注音不越过行界。判定只依赖整行
+ * 文本，词在何处折行尚不可知，因此行界只覆盖整行的两端。
+ * @param chunks - `chunkAndSplitLyricWords` 的输出，按渲染顺序排列
+ * @returns 可回收单词到回收量（em）的映射
  */
-const writeReclaim = (word: RubyWord) => {
-  const overflow = word.expanded ? 0 : word.overflow;
-  word.element.style.setProperty("--lp-ruby-overflow", `${overflow.toFixed(2)}px`);
-};
-
-/**
- * 合并词内假名的实测占位区间
- * @param word - 注音单词
- * @returns 占位区间，量不到有效尺寸（如未挂载）时为 undefined
- */
-const readBand = (word: RubyWord): RubyBand | undefined => {
-  let left = Number.POSITIVE_INFINITY;
-  let right = Number.NEGATIVE_INFINITY;
-  let top = Number.POSITIVE_INFINITY;
-  let bottom = Number.NEGATIVE_INFINITY;
-  for (const rt of word.annotations) {
-    const rect = rt.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) continue;
-    left = Math.min(left, rect.left);
-    right = Math.max(right, rect.right);
-    top = Math.min(top, rect.top);
-    bottom = Math.max(bottom, rect.bottom);
-  }
-  if (left >= right || top >= bottom) return undefined;
-  return { left, right, top, bottom };
-};
-
-/**
- * 收集每行的注音单词
- * @param wordMeasurements - 每行的单词测量数据
- */
-const collectRubyWords = (wordMeasurements: WordMeasurement[][]) => {
-  const lines: RubyWord[][] = [];
-  for (let i = 0; i < wordMeasurements.length; i++) {
-    const lineMeasurements = wordMeasurements[i];
-    if (!lineMeasurements) continue;
-    const words: RubyWord[] = [];
-    for (const m of lineMeasurements) {
-      if (!m.element.classList.contains("lp-ruby-word")) continue;
-      words.push({
-        element: m.element,
-        annotations: Array.from(m.element.querySelectorAll<HTMLElement>("rt")),
-        overflow: 0,
-        expanded: false,
+export function resolveRubyReclaimMap(
+  chunks: readonly (LyricWord | LyricWord[])[],
+): Map<LyricWord, number> {
+  const atoms: RubyAtom[] = [];
+  for (const chunk of chunks) {
+    for (const word of Array.isArray(chunk) ? chunk : [chunk]) {
+      atoms.push({
+        word,
+        text: word.word,
+        rubyText: (word.ruby ?? []).map((segment) => segment.word.trim()).join(""),
       });
     }
-    if (words.length > 0) lines.push(words);
   }
-  return lines;
-};
 
-/**
- * 逐轮量测并撑开相撞的注音单词
- * 撑开只会把同行后续内容推远，因此逐轮复核即可收敛
- * @param lines - 每行的注音单词
- */
-const expandCollided = (lines: RubyWord[][]) => {
-  for (let pass = 0; pass < MAX_PASSES; pass++) {
-    const collided = new Set<RubyWord>();
-    for (const words of lines) {
-      if (words.length < 2) continue;
-      const entries: { band: RubyBand; word: RubyWord }[] = [];
-      for (const word of words) {
-        const band = readBand(word);
-        if (band) entries.push({ band, word });
-      }
-      entries.sort((a, b) => a.band.left - b.band.left);
-      for (const index of findRubyCollisions(entries.map((entry) => entry.band))) {
-        collided.add(entries[index].word);
-      }
-    }
-
-    let changed = false;
-    for (const word of collided) {
-      if (word.expanded || word.overflow <= 0) continue;
-      word.expanded = true;
-      writeReclaim(word);
-      changed = true;
-    }
-    if (!changed) return;
-  }
-};
-
-/**
- * 回收词内注音挤占主歌词的行内宽度，并把相撞的假名退回撑开排版
- * @param wordMeasurements - 每行的单词测量数据
- */
-export const applyRubySpacing = (wordMeasurements: WordMeasurement[][]) => {
-  const lines = collectRubyWords(wordMeasurements);
-  const words = lines.flat();
-  if (words.length === 0) return;
-
-  const annotations = words.flatMap((word) => word.annotations);
-  // 隐藏假名与还原后各量一次盒宽，差值即假名挤占主歌词的行内宽度
-  for (const rt of annotations) rt.style.setProperty("display", "none");
-  const textWidths = words.map((word) => word.element.clientWidth);
-  for (const rt of annotations) rt.style.removeProperty("display");
-  const boxWidths = words.map((word) => word.element.clientWidth);
-  // 批量写入后再统一量测碰撞，避免读写交替引发多次回流
-  words.forEach((word, i) => {
-    word.overflow = Math.max(0, boxWidths[i] - textWidths[i]);
-    writeReclaim(word);
+  const reclaimMap = new Map<LyricWord, number>();
+  atoms.forEach((atom, index) => {
+    const expansion = measureExpansion(atom);
+    if (expansion === 0) return;
+    if (!hasHangRoom(atoms, index, -1) || !hasHangRoom(atoms, index, 1)) return;
+    reclaimMap.set(atom.word, expansion);
   });
-
-  expandCollided(lines);
-};
+  return reclaimMap;
+}
