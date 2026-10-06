@@ -302,31 +302,165 @@ const buildEmphasizedChunk = (
   });
 };
 
+/** 相邻注音假名之间保留的最小间距（像素），实测间距小于该值即判定为碰撞 */
+const RUBY_MIN_GAP = 0.5;
+
+/**
+ * 碰撞判定的最大轮次
+ * 每轮量一次几何，撑开注音后可能引发重新换行，多留轮次以保证最终收敛
+ */
+const RUBY_COLLISION_MAX_PASSES = 3;
+
+/** 注音单词的排版状态 */
+interface RubyWord {
+  /** 单词 span 元素 */
+  element: HTMLSpanElement;
+  /** 词内的假名元素 */
+  annotations: HTMLElement[];
+  /** 假名挤占主歌词的行内宽度 */
+  overflow: number;
+  /** 是否已取消回收，退回注音撑开间距的自然排版 */
+  expanded: boolean;
+}
+
+/** 注音假名在页面中的占位区间 */
+interface RubyBand {
+  rubyWord: RubyWord;
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+}
+
+/**
+ * 写出注音回收量，负外边距由 CSS 按该变量均摊到两侧
+ * @param rubyWord - 注音单词
+ */
+const applyRubyReclaim = (rubyWord: RubyWord) => {
+  const overflow = rubyWord.expanded ? 0 : rubyWord.overflow;
+  rubyWord.element.style.setProperty("--lp-ruby-overflow", `${Math.max(0, overflow).toFixed(2)}px`);
+};
+
+/**
+ * 合并词内所有假名的实测占位区间
+ * @param rubyWord - 注音单词
+ * @returns 占位区间；量不到有效尺寸（如元素未挂载）时返回 undefined
+ */
+const readRubyBand = (rubyWord: RubyWord): RubyBand | undefined => {
+  let left = Number.POSITIVE_INFINITY;
+  let right = Number.NEGATIVE_INFINITY;
+  let top = Number.POSITIVE_INFINITY;
+  let bottom = Number.NEGATIVE_INFINITY;
+  for (const rt of rubyWord.annotations) {
+    const rect = rt.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    left = Math.min(left, rect.left);
+    right = Math.max(right, rect.right);
+    top = Math.min(top, rect.top);
+    bottom = Math.max(bottom, rect.bottom);
+  }
+  if (left >= right || top >= bottom) return undefined;
+  return { rubyWord, left, right, top, bottom };
+};
+
+/**
+ * 判断两块注音占位是否相交：横向交叠且纵向同处一行
+ * @param a - 靠左的占位区间
+ * @param b - 靠右的占位区间
+ */
+const isRubyCollision = (a: RubyBand, b: RubyBand) =>
+  a.left < b.right - RUBY_MIN_GAP &&
+  b.left < a.right - RUBY_MIN_GAP &&
+  a.top < b.bottom &&
+  b.top < a.bottom;
+
+/**
+ * 收集一行内发生碰撞的注音单词
+ * @param bands - 按左边界排序后的占位区间
+ */
+const collectRubyCollisions = (bands: RubyBand[]) => {
+  const collided = new Set<RubyWord>();
+  for (let i = 0; i < bands.length; i++) {
+    const current = bands[i];
+    for (let j = i + 1; j < bands.length && bands[j].left < current.right - RUBY_MIN_GAP; j++) {
+      if (isRubyCollision(current, bands[j])) {
+        collided.add(current.rubyWord);
+        collided.add(bands[j].rubyWord);
+      }
+    }
+  }
+  return collided;
+};
+
+/**
+ * 按实测几何校正注音碰撞
+ * 撑开只会把同行后续内容推远、不会制造新的碰撞，因此逐轮量测即可收敛
+ * @param lines - 每行的注音单词
+ */
+const resolveRubyCollisions = (lines: RubyWord[][]) => {
+  for (let pass = 0; pass < RUBY_COLLISION_MAX_PASSES; pass++) {
+    const collided = new Set<RubyWord>();
+    for (const words of lines) {
+      if (words.length < 2) continue;
+      const bands: RubyBand[] = [];
+      for (const word of words) {
+        const band = readRubyBand(word);
+        if (band) bands.push(band);
+      }
+      bands.sort((a, b) => a.left - b.left);
+      for (const word of collectRubyCollisions(bands)) collided.add(word);
+    }
+
+    let changed = false;
+    for (const word of collided) {
+      if (word.expanded || word.overflow <= 0) continue;
+      word.expanded = true;
+      applyRubyReclaim(word);
+      changed = true;
+    }
+    if (!changed) return;
+  }
+};
+
 /**
  * 量出词内注音撑开单词盒的溢出宽度，写入 --lp-ruby-overflow 供负外边距回收
  * 隐藏假名量一次、还原后再量一次，两次差值即假名挤占主歌词的行内宽度
+ * 回收会让宽注音溢出到相邻字上，故再按实测几何判定碰撞并撑开相撞的单词
  * @param wordMeasurements - 每行的单词测量数据
  */
 const measureRubyOverflow = (wordMeasurements: WordMeasurement[][]) => {
-  const words: HTMLSpanElement[] = [];
+  const lines: RubyWord[][] = [];
   for (let i = 0; i < wordMeasurements.length; i++) {
     const lineMeasurements = wordMeasurements[i];
     if (!lineMeasurements) continue;
-    for (const m of lineMeasurements)
-      if (m.element.classList.contains("lp-ruby-word")) words.push(m.element);
+    const words: RubyWord[] = [];
+    for (const m of lineMeasurements) {
+      if (!m.element.classList.contains("lp-ruby-word")) continue;
+      words.push({
+        element: m.element,
+        annotations: Array.from(m.element.querySelectorAll<HTMLElement>("rt")),
+        overflow: 0,
+        expanded: false,
+      });
+    }
+    if (words.length > 0) lines.push(words);
   }
-  if (words.length === 0) return;
+  if (lines.length === 0) return;
 
-  const annotations = words.flatMap((word) => Array.from(word.querySelectorAll<HTMLElement>("rt")));
+  const annotations = lines.flatMap((words) => words.flatMap((word) => word.annotations));
+  const allWords = lines.flat();
   for (const rt of annotations) rt.style.setProperty("display", "none");
-  const textWidths = words.map((word) => word.clientWidth);
+  const textWidths = allWords.map((word) => word.element.clientWidth);
   for (const rt of annotations) rt.style.removeProperty("display");
-  const boxWidths = words.map((word) => word.clientWidth);
+  const boxWidths = allWords.map((word) => word.element.clientWidth);
 
-  words.forEach((word, i) => {
-    const overflow = boxWidths[i] - textWidths[i];
-    word.style.setProperty("--lp-ruby-overflow", `${Math.max(0, overflow).toFixed(2)}px`);
+  // 先批量写入回收量，再统一按实测几何判定碰撞，避免读写交替引发多次回流
+  allWords.forEach((word, i) => {
+    word.overflow = Math.max(0, boxWidths[i] - textWidths[i]);
+    applyRubyReclaim(word);
   });
+
+  resolveRubyCollisions(lines);
 };
 
 /**
