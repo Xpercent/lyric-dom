@@ -60,7 +60,7 @@ export const findRubyCollisions = (bands: RubyBand[]) => {
  */
 const writeReclaim = (word: RubyWord) => {
   const overflow = word.expanded ? 0 : word.overflow;
-  word.element.style.setProperty("--lp-ruby-overflow", `${Math.max(0, overflow).toFixed(2)}px`);
+  word.element.style.setProperty("--lp-ruby-overflow", `${overflow.toFixed(2)}px`);
 };
 
 /**
