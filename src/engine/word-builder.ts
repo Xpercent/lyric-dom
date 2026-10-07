@@ -3,6 +3,7 @@
 import type { LyricLine, LyricSpan, LyricWord, WordAnimTarget, WordMeasurement } from "../types";
 import { chunkAndSplitLyricWords, needsSpaceBetween } from "../utils/split-words";
 import { shouldChunkEmphasize } from "./emphasize";
+import { resolveRubyReclaimMap } from "./ruby-layout";
 
 export type { WordAnimTarget, WordMeasurement };
 
@@ -43,6 +44,7 @@ export const buildWordSpans = (
     showWordRoman = false,
   } = options;
   const chunks = chunkAndSplitLyricWords(words);
+  const rubyReclaim = resolveRubyReclaimMap(chunks);
   const measurements: WordMeasurement[] = [];
   const animTargets: WordAnimTarget[] = [];
 
@@ -83,6 +85,7 @@ export const buildWordSpans = (
       const lastAtom = atoms[atoms.length - 1];
       if (lastAtom) previousText = lastAtom.word.trim();
     }
+    applyRubyReclaim(measurements, rubyReclaim);
     return { measurements, animTargets };
   }
 
@@ -144,7 +147,20 @@ export const buildWordSpans = (
       }
     }
   }
+  applyRubyReclaim(measurements, rubyReclaim);
   return { measurements, animTargets };
+};
+
+/**
+ * 把注音悬挂的回收量写到单词 span 上，供 renderer.css 的负外边距取用
+ * @param measurements - 已构建的单词测量数据
+ * @param rubyReclaim - 可回收单词到回收量（em）的映射
+ */
+const applyRubyReclaim = (measurements: WordMeasurement[], rubyReclaim: Map<LyricWord, number>) => {
+  for (const m of measurements) {
+    const reclaim = rubyReclaim.get(m.word);
+    if (reclaim) m.element.style.setProperty("--lp-ruby-overflow", `${reclaim.toFixed(2)}em`);
+  }
 };
 
 /**
@@ -303,33 +319,6 @@ const buildEmphasizedChunk = (
 };
 
 /**
- * 量出词内注音撑开单词盒的溢出宽度，写入 --lp-ruby-overflow 供负外边距回收
- * 隐藏假名量一次、还原后再量一次，两次差值即假名挤占主歌词的行内宽度
- * @param wordMeasurements - 每行的单词测量数据
- */
-const measureRubyOverflow = (wordMeasurements: WordMeasurement[][]) => {
-  const words: HTMLSpanElement[] = [];
-  for (let i = 0; i < wordMeasurements.length; i++) {
-    const lineMeasurements = wordMeasurements[i];
-    if (!lineMeasurements) continue;
-    for (const m of lineMeasurements)
-      if (m.element.classList.contains("lp-ruby-word")) words.push(m.element);
-  }
-  if (words.length === 0) return;
-
-  const annotations = words.flatMap((word) => Array.from(word.querySelectorAll<HTMLElement>("rt")));
-  for (const rt of annotations) rt.style.setProperty("display", "none");
-  const textWidths = words.map((word) => word.clientWidth);
-  for (const rt of annotations) rt.style.removeProperty("display");
-  const boxWidths = words.map((word) => word.clientWidth);
-
-  words.forEach((word, i) => {
-    const overflow = boxWidths[i] - textWidths[i];
-    word.style.setProperty("--lp-ruby-overflow", `${Math.max(0, overflow).toFixed(2)}px`);
-  });
-};
-
-/**
  * 测量所有单词的宽度并设置 CSS 掩码
  * 采用读写分离策略：第一遍批量读取所有 DOM 尺寸（触发一次回流），
  * 第二遍批量写入所有 CSS mask 样式（零回流），避免逐词读写交替导致的 N 次强制回流
@@ -342,8 +331,6 @@ export const measureAndApplyWordMasks = (
   fadeRatio: number,
   lines?: LyricLine[],
 ) => {
-  measureRubyOverflow(wordMeasurements);
-
   // 临时存储每个 measurement 的 padding，供第二遍使用
   const paddings: number[][] = new Array(wordMeasurements.length);
 
